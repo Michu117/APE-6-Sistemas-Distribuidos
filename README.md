@@ -436,9 +436,250 @@ Respuestas de `FleetController` con `curl`:
 
 ---
 
+# Despliegue en 4 PCs
+
+La misma aplicación `fleet-monitor` se reparte entre varias PCs conectadas a un router sin
+duplicar el proyecto: cada servicio es un perfil de Spring (`@Profile`) y cada PC arranca
+solo el suyo. Todas se conectan al RabbitMQ de la PC 1 a través de la variable
+`RABBIT_HOST` (`spring.rabbitmq.host=${RABBIT_HOST:localhost}`).
+
+| Perfil | Clase | Función |
+|---|---|---|
+| `gps` | `GpsConsumer` | Consume `cola.gps.telemetria` y registra `GPS recibido` |
+| `alertas` | `AlertConsumer` | Consume las colas de temperatura y combustible y reenvía a `cola.notificaciones` |
+| `notificaciones` | `NotificationConsumer` | Consume `cola.notificaciones` y registra `NOTIFICACION al operador` |
+| `api` | `FleetController` | Expone `/api/fleet/status` y `/api/fleet/vehicle/{id}/telemetria` en el puerto 8080 |
+
+Si no se indica ningún perfil, se activan `gps`, `alertas` y `api` en un solo proceso, que es
+la ejecución de la Parte 2 descrita arriba.
+
+## Distribución de servicios
+
+| PC | Ejecuta | Puertos que debe aceptar |
+|---|---|---|
+| PC 1 — Brokers | Mosquitto, RabbitMQ, `mqtt_rabbitmq_bridge.py` y `simulador_sensores.py` | `5672` (AMQP) y `15672` (panel) |
+| PC 2 — GPS | `fleet-monitor` con perfil `gps` | — |
+| PC 3 — Alertas | `fleet-monitor` con perfil `alertas` | — |
+| PC 4 — Notificaciones y API | `fleet-monitor` con perfiles `notificaciones,api` | `8080` (API REST) |
+
+```mermaid
+flowchart LR
+    subgraph PC1 [PC 1 · Brokers]
+        S[Simulador] --> M[(Mosquitto)] --> B[Puente] --> R[(RabbitMQ<br/>:5672)]
+    end
+    R -- cola.gps.telemetria --> G[PC 2 · gps]
+    R -- "cola.alertas.temperatura<br/>cola.combustible.nivel" --> A[PC 3 · alertas]
+    A -- cola.notificaciones --> R
+    R -- cola.notificaciones --> N[PC 4 · notificaciones]
+    U[curl / navegador] -- ":8080/api/fleet" --> API[PC 4 · api]
+```
+
+El puente y el simulador usan `localhost` para conectarse a Mosquitto y RabbitMQ, por eso
+corren en la misma PC que los brokers. Las demás PCs se conectan con el usuario `admin`:
+RabbitMQ solo permite el usuario `guest` desde `localhost`, así que no serviría para
+conexiones remotas.
+
+## Preparación de la red
+
+1. Conecta las 4 PCs al mismo router.
+2. Averigua la IP de la PC 1 (`ip -4 addr` en Linux, `ipconfig` en Windows, por ejemplo
+   `192.168.1.10`). Los comandos siguientes usan `IP_PC1` en su lugar.
+3. Abre en el firewall de la PC 1 los puertos `5672` y `15672`, y en el de la PC 4 el `8080`:
+   - Fedora: `sudo firewall-cmd --add-port=5672/tcp --add-port=15672/tcp`
+   - Ubuntu: `sudo ufw allow 5672/tcp && sudo ufw allow 15672/tcp`
+   - Windows (PowerShell como administrador):
+     `New-NetFirewallRule -DisplayName "RabbitMQ" -Direction Inbound -Protocol TCP -LocalPort 5672,15672 -Action Allow`
+4. Comprueba desde las PCs 2, 3 y 4 que llegan a RabbitMQ: abre `http://IP_PC1:15672` en el
+   navegador.
+5. Las PCs 2, 3 y 4 necesitan el repositorio clonado, JDK 21 y Maven. La PC 1 necesita Docker
+   y el entorno virtual de Python de la sección [Preparación](#preparación).
+
+## Ejecución
+
+Sigue este orden.
+
+**PC 1: brokers.** Desde la raíz del repositorio:
+
+```bash
+cd practica5 && docker compose down && docker compose up -d mosquitto
+cd ../practica6 && docker compose -f docker-compose-rabbitmq.yml up -d
+```
+
+**PCs 2, 3 y 4: servicios.** Desde `practica6/fleet-monitor`, cada una con su perfil:
+
+```bash
+# Linux / macOS
+RABBIT_HOST=IP_PC1 mvn spring-boot:run -Dspring-boot.run.profiles=gps                    # PC 2
+RABBIT_HOST=IP_PC1 mvn spring-boot:run -Dspring-boot.run.profiles=alertas                # PC 3
+RABBIT_HOST=IP_PC1 mvn spring-boot:run -Dspring-boot.run.profiles=notificaciones,api     # PC 4
+```
+
+```powershell
+# Windows (PowerShell)
+$env:RABBIT_HOST="IP_PC1"; mvn spring-boot:run "-Dspring-boot.run.profiles=gps"                  # PC 2
+$env:RABBIT_HOST="IP_PC1"; mvn spring-boot:run "-Dspring-boot.run.profiles=alertas"              # PC 3
+$env:RABBIT_HOST="IP_PC1"; mvn spring-boot:run "-Dspring-boot.run.profiles=notificaciones,api"   # PC 4
+```
+
+Cada servicio muestra al iniciar `The following 1 profile is active: "gps"` (o el perfil que
+corresponda) y `Created new connection: ... amqp://admin@IP_PC1:5672/`.
+
+**PC 1: flujo de datos.** En dos terminales, con el entorno virtual activado:
+
+```bash
+python practica6/mqtt_rabbitmq_bridge.py
+python practica5/simulador_sensores.py
+```
+
+## Verificación
+
+- **PC 2:** la consola muestra `GPS recibido`.
+- **PC 3:** la consola muestra `ALERTA TEMPERATURA` y `ALERTA COMBUSTIBLE`.
+- **PC 4:** la consola muestra `NOTIFICACION al operador`.
+- **API**, desde cualquier PC:
+  ```bash
+  curl http://IP_PC4:8080/api/fleet/status
+  curl http://IP_PC4:8080/api/fleet/vehicle/VH-001/telemetria
+  ```
+- **Panel de RabbitMQ** en `http://IP_PC1:15672` (usuario `admin`, clave `admin123`):
+  - En *Connections* aparece una conexión por cada PC de servicios, con su IP.
+  - En *Queues and Streams* cada cola tiene 1 consumidor y se mantiene cerca de 0 mensajes,
+    incluida `cola.notificaciones`.
+
+> Se probó en un solo equipo: cada perfil se ejecutó como un proceso separado (con puertos
+> HTTP distintos) y conectado a RabbitMQ por la IP de red en lugar de `localhost`. Cada
+> proceso consumió solo su cola, y la API respondió únicamente en el proceso con el perfil
+> `api`. Falta repetir la prueba en las 4 PCs físicas.
+
+---
+
+# Despliegue distribuido con Docker
+
+Variante del despliegue anterior en la que cada microservicio corre en un contenedor Docker.
+Las PCs de servicios solo necesitan Docker y el repositorio clonado; no hace falta instalar
+JDK ni Maven, porque la imagen compila el proyecto.
+
+| Archivo | Función |
+|---|---|
+| `practica6/fleet-monitor/Dockerfile` | Compila el proyecto con Maven y JDK 21, y ejecuta el `.jar` sobre una imagen solo con JRE 21 |
+| `practica6/fleet-monitor/.dockerignore` | Excluye `target/` del contexto de construcción |
+| `practica6/docker-compose-servicio.yml` | Levanta un microservicio: el perfil sale de `PERFIL` y el host de RabbitMQ de `RABBIT_HOST` |
+
+Todas las PCs usan la misma imagen; lo único que cambia es el perfil (`SPRING_PROFILES_ACTIVE`).
+El contenedor se llama `fleet-<perfil>`, por ejemplo `fleet-gps`.
+
+## Distribución de servicios
+
+| PC | Ejecuta | Puertos que debe aceptar |
+|---|---|---|
+| PC 1 — Brokers y API | Mosquitto, RabbitMQ, `mqtt_rabbitmq_bridge.py`, `simulador_sensores.py` y el contenedor `fleet-api` | `5672`, `15672` y `8080` |
+| PC 2 — GPS | Contenedor `fleet-gps` | — |
+| PC 3 — Alertas | Contenedor `fleet-alertas` | — |
+| PC 4 — Notificaciones | Contenedor `fleet-notificaciones` | — |
+
+```mermaid
+flowchart LR
+    subgraph PC1 [PC 1 · Brokers y API]
+        S[Simulador] --> M[(Mosquitto)] --> B[Puente] --> R[(RabbitMQ<br/>:5672)]
+        API[fleet-api<br/>:8080]
+    end
+    R -- cola.gps.telemetria --> G[PC 2 · fleet-gps]
+    R -- "cola.alertas.temperatura<br/>cola.combustible.nivel" --> A[PC 3 · fleet-alertas]
+    A -- cola.notificaciones --> R
+    R -- cola.notificaciones --> N[PC 4 · fleet-notificaciones]
+    U[curl / navegador] -- ":8080/api/fleet" --> API
+```
+
+Cada contenedor ejecuta un solo perfil. `PERFIL` no admite varios perfiles separados por
+coma, porque forma parte del nombre del contenedor (`fleet-${PERFIL}`) y Docker no acepta
+comas en los nombres. Por eso la API corre en la PC 1, junto a los brokers.
+
+## Preparación
+
+1. Conecta las 4 PCs al mismo router, averigua la IP de la PC 1 (`IP_PC1`) y abre en su
+   firewall los puertos `5672`, `15672` y `8080`. Los comandos están en
+   [Preparación de la red](#preparación-de-la-red).
+2. Instala Docker en las 4 PCs y clona el repositorio.
+3. La PC 1 necesita además el entorno virtual de Python de la sección [Preparación](#preparación).
+
+Dentro de un contenedor, `localhost` es el propio contenedor, así que `RABBIT_HOST` siempre
+debe ser la IP de la PC 1, incluso para `fleet-api`, que corre en esa misma PC.
+
+## Ejecución
+
+Sigue este orden. Todos los comandos parten de la raíz del repositorio.
+
+**PC 1: brokers.**
+
+```bash
+cd practica5 && docker compose down && docker compose up -d mosquitto
+cd ../practica6 && docker compose -f docker-compose-rabbitmq.yml up -d
+```
+
+**Cada PC: su microservicio.** Desde `practica6/`, cambiando `PERFIL` según la PC: `api`
+en la PC 1, `gps` en la PC 2, `alertas` en la PC 3 y `notificaciones` en la PC 4. La primera
+vez la construcción de la imagen tarda unos minutos porque Maven descarga las dependencias.
+
+```bash
+# Linux / macOS (ejemplo de la PC 2)
+cd practica6
+PERFIL=gps RABBIT_HOST=IP_PC1 docker compose -p fleet-gps -f docker-compose-servicio.yml up -d --build
+```
+
+```powershell
+# Windows (PowerShell, ejemplo de la PC 2)
+cd practica6
+$env:PERFIL="gps"; $env:RABBIT_HOST="IP_PC1"
+docker compose -p fleet-gps -f docker-compose-servicio.yml up -d --build
+```
+
+La opción `-p fleet-<perfil>` le da a cada microservicio su propio proyecto de Compose. Sin
+ella, en la PC 1 el microservicio compartiría el proyecto `practica6` con RabbitMQ y Compose
+lo mostraría como contenedor huérfano.
+
+**PC 1: flujo de datos.** En dos terminales, con el entorno virtual activado:
+
+```bash
+python practica6/mqtt_rabbitmq_bridge.py
+python practica5/simulador_sensores.py
+```
+
+Para ver los logs de un microservicio y para detenerlo:
+
+```bash
+docker logs -f fleet-gps
+PERFIL=gps RABBIT_HOST=IP_PC1 docker compose -p fleet-gps -f docker-compose-servicio.yml down
+```
+
+## Verificación
+
+- **Logs de cada contenedor** (`docker logs -f fleet-<perfil>`):
+  - Al iniciar: `The following 1 profile is active: "<perfil>"`. Los consumidores muestran
+    además `Created new connection: ... amqp://admin@IP_PC1:5672/`.
+  - PC 2 (`fleet-gps`): `GPS recibido`.
+  - PC 3 (`fleet-alertas`): `ALERTA TEMPERATURA` y `ALERTA COMBUSTIBLE`.
+  - PC 4 (`fleet-notificaciones`): `NOTIFICACION al operador`.
+- **API**, desde cualquier PC:
+  ```bash
+  curl http://IP_PC1:8080/api/fleet/status
+  curl http://IP_PC1:8080/api/fleet/vehicle/VH-001/telemetria
+  ```
+- **Panel de RabbitMQ** en `http://IP_PC1:15672` (usuario `admin`, clave `admin123`): cada cola
+  tiene 1 consumidor y se mantiene cerca de 0 mensajes, incluida `cola.notificaciones`.
+
+> Se probó en un solo equipo: se construyó la imagen y se levantaron los 4 contenedores, cada
+> uno con su perfil y conectado a RabbitMQ por la IP de red. `fleet-api` se levantó con
+> `docker-compose-servicio.yml`; los otros tres con `docker run` sobre la misma imagen y sin
+> publicar el puerto 8080, que en un solo equipo solo puede usar un contenedor. Cada
+> contenedor procesó solo su cola, las 4 colas quedaron con 1 consumidor y la API respondió.
+> Falta repetir la prueba en las 4 PCs físicas.
+
+---
+
 # Estructura del repositorio
 
 ```
+.gitignore                          # Excluye .venv/ de la raíz
 practica5/                          # Parte 1 — APE-5
 ├── Capturas/                       # Evidencias de cada actividad
 ├── mosquitto/config/
@@ -452,8 +693,11 @@ practica5/                          # Parte 1 — APE-5
 practica6/                          # Parte 2 — APE-6
 ├── capturas/                       # Evidencias de las actividades 5 a 8
 ├── docker-compose-rabbitmq.yml     # RabbitMQ con usuario admin
+├── docker-compose-servicio.yml     # Un microservicio en Docker según PERFIL
 ├── mqtt_rabbitmq_bridge.py         # Puente hacia exchange.fleet
 └── fleet-monitor/                  # Proyecto Spring Boot (Maven)
+    ├── Dockerfile                  # Imagen de los microservicios
+    ├── .dockerignore
     ├── pom.xml
     └── src/main/
         ├── resources/application.properties
@@ -463,6 +707,7 @@ practica6/                          # Parte 2 — APE-6
             ├── model/GpsMessage.java
             ├── consumer/
             │   ├── GpsConsumer.java
-            │   └── AlertConsumer.java
+            │   ├── AlertConsumer.java
+            │   └── NotificationConsumer.java
             └── controller/FleetController.java
 ```

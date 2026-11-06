@@ -1,10 +1,12 @@
 package com.fleet.monitor.controller;
 
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.http.ResponseEntity;
 
 import java.util.*;
 
+@Profile("api")
 @RestController
 @RequestMapping("/api/fleet")
 public class FleetController {

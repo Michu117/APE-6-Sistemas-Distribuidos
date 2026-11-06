@@ -1,0 +1,10 @@
+services:
+  microservicio:
+    build: ./fleet-monitor
+    container_name: fleet-${PERFIL}
+    environment:
+      SPRING_PROFILES_ACTIVE: ${PERFIL}
+      RABBIT_HOST: ${RABBIT_HOST}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
